@@ -1,0 +1,329 @@
+'use strict';
+const functions = require('firebase-functions');
+const firebase = require('firebase');
+const admin = require('firebase-admin');
+const verify = require('./verify');
+admin.initializeApp();
+
+const configs = {
+    reward: 500,
+    freeMaxClaim: 12,
+    minimumWithdraw: 350000,
+    premiumMinimumWithdraw: 150000,
+    waitPeriod: 1800 // in seconds
+};
+
+exports.initUserData = functions.auth.user().onCreate(event => {
+    const user = event.data; // The Firebase user.
+    const uid = user.uid;
+    const dbUser = {
+        displayName: user.displayName, // The display name of the user.
+        email: user.email, // The email of the user.,
+        photoURL: user.photoURL, // The display name of the user.,
+        ether: 0,
+        lastWatch: 0, // Should be used only for displaying purpose.
+        premium: false
+    };
+    return initUserData(uid, JSON.stringify(dbUser));
+});
+
+exports.withdrawCoin = functions.https.onRequest((req, res) => {
+    var result = {};
+    result.onCreate = Date.now();
+    return admin.auth()
+        .verifyIdToken(req.query.auth)
+        .then(decodedToken => {
+            result.userId = decodedToken.uid;
+            return result;
+        })
+        .then(getRewardableWatches)
+        .then(getUser)
+        .then(result => {
+            var limit = result.user.premium ? configs.premiumMinimumWithdraw : configs.minimumWithdraw;
+            if (result.ethersToPay >= limit) {
+                return admin.database().ref('users/' + result.userId + '/ether').set(0)
+                    .then(() => {
+                        return admin.database().ref('users/' + result.userId + '/watches').update(result.watches)
+                            .then(() => {
+                                const orderRef = admin.database().ref('users/' + result.userId + '/orders').push();
+
+                                result.order = {
+                                    address: req.query.address,
+                                    amount: result.ethersToPay,
+                                    processed: false,
+                                    onCreate: result.onCreate
+                                };
+                                return orderRef.set(result.order)
+                                    .then(() => {
+                                        result.orderId = orderRef.key;
+                                        return result;
+                                    })
+                                    .then(result => {
+                                        if (result.orderId) {
+                                            result.order.userId = result.userId;
+                                            result.order.orderId = result.orderId;
+                                            const gOrderRef = admin.database().ref('manage/orders').push();
+                                            gOrderRef.set(result.order).then(() => {
+                                                return res.status(200).send({
+                                                    orderId: result.orderId,
+                                                    onCreate: result.onCreate
+                                                });
+                                            });
+                                        }
+                                    });
+                            });
+                    });
+            } else {
+                throw 'Cannot claim due to low amount: ' + result.ethersToPay + ' on user: ' + result.userId
+            }
+        })
+        .catch(function (error) {
+            // Handle error
+            console.log("error: " + error);
+            return res.status(400).send('ERROR!.!');
+        });
+});
+
+exports.playVideo = functions.https.onRequest((req, res) => {
+    var result = {};
+    result.onCreate = Date.now();
+    return admin.auth()
+        .verifyIdToken(req.query.auth)
+        .then(decodedToken => {
+            result.userId = decodedToken.uid;
+            return result;
+        })
+        .then(result => {
+            result.startAt = result.onCreate - configs.waitPeriod * 1000;
+            result.yesterday = result.onCreate - 24 * 60 * 60 * 1000;
+            return result;
+        })
+        .then(getRecentWatches)
+        .then(getUser)
+        .then(result => {
+            if (canPlayVideo(result)) {
+                return startPlaying(result)
+                    .then(updateLastWatch)
+                    .then(() => {
+                        return res.status(200).send({
+                            watchId: result.watchId,
+                            onCreate: result.onCreate
+                        });
+                    })
+                    .catch(error => {
+                        console.log(error);
+                        return res.status(400).send('Internal Error 53');
+                    });
+            } else {
+                return res.status(429).send('Too Many Request');
+            }
+        })
+        .catch(function (error) {
+            // Handle error
+            console.log("error: " + error);
+            return res.status(400).send('ERROR!.!');
+        });
+});
+
+exports.rewardWatch = functions.database.ref('/users/{userId}/watches/{watchId}/status').onUpdate((change, context) => {
+    console.log("Rewarding user: " + context.params.userId + " for Watch: " + context.params.watchId);
+    if (change.before.val() === 'PLAYING' && change.after.val() === 'FINISHED') {
+        var userRef = admin.database().ref('users/' + context.params.userId);
+        return userRef.child('ether')
+            .transaction(ether => {
+                return ether + configs.reward;
+            })
+            .then(() => {
+                return userRef.child('watches/' + context.params.watchId + '/reward').set(configs.reward);
+            });
+    }
+});
+
+exports.processReward = functions.database.ref('/manage/orders/{orderId}').onUpdate(event => {
+    var gOrder = event.data.val();
+    if (gOrder.processed === true) {
+        return admin.database().ref('users/' + gOrder.userId + '/orders/' + gOrder.orderId + '/processed').set(true);
+    }
+});
+
+exports.sendPushMessages = functions.database.ref('/manage/notifications/{pushId}').onCreate(event => {
+    var notification = event.data.val();
+    if (event.data.previous.exists() || notification.isSent === true) {
+        return;
+    }
+
+    var payload = {
+        data: {
+            body: notification.body
+        }
+    };
+
+    if (notification.title !== null && notification.title !== '') {
+        payload.data.title = notification.title;
+    }
+
+    if (notification.uri !== null && notification.uri !== '') {
+        payload.data.uri = notification.uri;
+    }
+
+    return admin.messaging().sendToTopic(notification.topic, payload)
+        .then(() => {
+            return admin.database().ref('/manage/notifications/' + event.params.pushId + '/isSent').set(true);
+        })
+        .then(function (response) {
+            console.log("Successfully sent message:", response);
+        })
+        .catch(function (error) {
+            console.log("Error sending message:", error);
+        });
+});
+
+exports.processPurchase = functions.database.ref('/purchases/{userId}/{sku}').onCreate(event => {
+    var marketItem = event.data.val();
+    if (!validateItem(marketItem)) {
+        console.error("Invalid market item: " + marketItem);
+        return admin.database().ref('market/invalid/' + event.params.sku + '/' + event.params.userId).set(marketItem);
+    }
+    var item = JSON.parse(marketItem.json);
+    return handlePurchase(event.params.userId, item)
+        .then(() => {
+            return admin.database().ref('purchases/' + event.params.userId + '/' + event.params.sku).remove();
+        })
+});
+
+function handlePurchase(userId, item) {
+    switch (item.productId) {
+        case 'premium':
+            return handlePremiumPurchase(userId, item);
+        default:
+            console.error("Unknown market item: " + item)
+    }
+}
+
+function handlePremiumPurchase(userId, item) {
+    return admin.database().ref('market/premium')
+        .orderByChild('orderId')
+        .equalTo(item.orderId)
+        .once('value')
+        .then(snapshot => {
+            if (snapshot.exists()) {
+                return snapshot.forEach(child => {
+                    if (child.key === userId) {
+                        console.log("Trying to reuse existing purchase. userId: " + userId + " item: " + JSON.stringify(item));
+                    } else {
+                        console.warn("Trying to duplicate existing purchase. userId: " + userId + " item: " + JSON.stringify(item));
+                        return admin.database().ref('market/duplicate/premium/' + userId + '/' + item.purchaseTime).set(item);
+                    }
+                });
+            } else {
+                return admin.database().ref('users/' + userId + '/premium').set(true)
+                    .then(() => {
+                        return admin.database().ref('market/premium/' + userId).set(item);
+                    });
+            }
+        })
+}
+
+function validateItem(marketItem) {
+    if (marketItem.json && marketItem.signature) {
+        return verify.verifyPurchase(marketItem.json, marketItem.signature);
+    }
+    return false;
+}
+
+function canPlayVideo(result) {
+    if (result.watches) {
+        if (!result.user.premium && Object.keys(result.watches).length > configs.freeMaxClaim) {
+            console.log("Watches by PREMIUM check: " + JSON.stringify(result.watches));
+            return false;
+        }
+        var processesWatches = Object.filter(result.watches, watch => {
+            switch (watch.status) {
+                case 'FINISHED':
+                case 'PLAYING':
+                case 'REWARDED':
+                    return watch.onCreate > result.startAt;
+                case 'FAILED':
+                default:
+                    return false;
+            }
+        });
+        console.log("Watches by 30Min check: " + JSON.stringify(processesWatches));
+        return Object.keys(processesWatches).length === 0;
+    } else {
+        return true;
+    }
+}
+
+function getUser(result) {
+    return admin.database()
+        .ref('users/' + result.userId)
+        .once('value')
+        .then(snapshot => {
+            result.user = snapshot.val();
+            return result;
+        });
+}
+
+function initUserData(userId, jsonUser) {
+    console.log("initUserData initiating for: " + jsonUser);
+    var user = JSON.parse(jsonUser);
+    user.onCreate = firebase.database.ServerValue.TIMESTAMP;
+    return admin.database().ref('users/' + userId).set(user);
+}
+
+function startPlaying(result) {
+    const watchRef = admin.database().ref('users/' + result.userId + '/watches').push();
+    return watchRef.set({
+        status: 'PLAYING',
+        onCreate: result.onCreate
+    })
+        .then(() => {
+            console.log('startPlaying: ' + watchRef.key);
+            result.watchId = watchRef.key;
+            return result;
+        });
+}
+
+function updateLastWatch(result) {
+    return admin.database().ref('users/' + result.userId + '/lastWatch').set(result.onCreate);
+}
+
+function getRecentWatches(result) {
+    return admin.database().ref('users/' + result.userId + '/watches')
+        .orderByChild('onCreate')
+        .startAt(result.yesterday)
+        .once('value')
+        .then(snapshot => {
+            result.watches = snapshot.val();
+            return result;
+        });
+}
+
+function getRewardableWatches(result) {
+    return admin.database().ref('users/' + result.userId + '/watches')
+        .orderByChild('status')
+        .equalTo('FINISHED')
+        .once('value')
+        .then(snapshot => {
+            var watches = snapshot.val();
+            var processedWatches = {};
+            var ethersToPay = 0;
+            Object.keys(watches).forEach(key => {
+                var watch = watches[key];
+                if (watch.onCreate && watch.onCreate < result.onCreate) {
+                    watch.status = "REWARDED";
+                    processedWatches[key] = watch;
+                    ethersToPay += watch.reward || 0;
+                }
+            });
+            result.watches = processedWatches;
+            result.ethersToPay = ethersToPay;
+            return result;
+        });
+}
+
+Object.filter = (obj, predicate) =>
+    Object.keys(obj)
+        .filter(key => predicate(obj[key]))
+        .reduce((res, key) => (res[key] = obj[key], res), {});
